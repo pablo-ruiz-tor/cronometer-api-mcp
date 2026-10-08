@@ -175,10 +175,18 @@ def get_food_log(
     entries, prefer get_daily_nutrition(days=N).
 
     Returns every food entry logged for the day. Each "Serving" entry is
-    enriched (best-effort) with the food's name, source, the serving measure
-    (unit name and grams per unit), the number of servings, and that food's
-    own nutrient profile scaled to the amount eaten. Non-food entries
-    (exercise, biometrics) carry their own name.
+    enriched (best-effort) with the food's name, source, serving_size, servings,
+    and that food's own nutrient profile scaled to the amount eaten. Non-food
+    entries (exercise, biometrics) carry their own name.
+
+    serving_size defines one portion: quantity units weighing grams in total.
+    servings is how many of those portions were consumed. For example,
+    serving_size={quantity: 2, unit: "cookies", grams: 30} with servings=1
+    means two cookies eaten; servings=0.5 means one cookie eaten. The size
+    uses the entry's selected measure, or the food's default as a fallback.
+    For serving-based recipes, serving_size.grams is null because the API
+    uses reference-serving counts instead of gram weights. An invalid
+    serving_size.quantity is reported as null.
 
     Note: the per-entry "nutrients" are each food's individual contribution,
     which is distinct from the day-level nutrition_summary aggregate below.
@@ -544,6 +552,8 @@ def get_food_details(food_id: int) -> str:
                     "measure_id": m.get("id"),
                     "name": m.get("name"),
                     "grams": m.get("value"),
+                    "quantity": m.get("amount"),
+                    "type": m.get("type"),
                 }
             )
 
@@ -652,6 +662,7 @@ def update_custom_food(
     extra_nutrients: dict[int, float] | None = None,
     serving_name: str | None = None,
     serving_grams: float | None = None,
+    serving_quantity: float | None = None,
 ) -> str:
     """Edit an existing custom food (one you created) in place.
 
@@ -680,8 +691,18 @@ def update_custom_food(
         extra_nutrients: Additional nutrients keyed by Cronometer nutrient ID
             (from get_daily_nutrition) and valued per serving; must not reuse
             an ID the named args already cover.
-        serving_name: New name for the default serving.
-        serving_grams: New weight of the default serving in grams.
+        serving_name: New name for the default serving. The app shows the
+            serving as "<quantity> <name>"; a leading number ("2 cookies")
+            is taken as the quantity (see serving_quantity).
+        serving_grams: New total weight of the default serving in grams.
+            Also resets the quantity to serving_quantity (or 1).
+        serving_quantity: How many units make up the default serving
+            (default 1 whenever serving_grams is passed). Without
+            serving_grams the serving's total weight stays the same, so each
+            unit gets lighter or heavier: changing "2 cookies = 30 g" to 3
+            gives "3 cookies = 30 g". To keep the per-unit weight, also pass
+            serving_grams (45 here). Check the result with get_food_details,
+            which lists each measure's quantity.
     """
     try:
         client = _get_client()
@@ -699,6 +720,7 @@ def update_custom_food(
             extra_nutrients=extra_nutrients,
             serving_name=serving_name,
             serving_grams=serving_grams,
+            serving_quantity=serving_quantity,
         )
         return _ok({"food_id": result["food_id"], "name": result["name"]})
     except Exception as e:

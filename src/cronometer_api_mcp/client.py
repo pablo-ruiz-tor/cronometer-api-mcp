@@ -15,7 +15,9 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
+import re
 import struct
 import threading
 import time
@@ -82,6 +84,9 @@ _OZ_GRAMS = 28.3495231
 # Nutrient IDs create_custom_food() already writes via its named macro args
 # (including the derived/negative-ID duplicates it sends alongside them).
 # extra_nutrients must not reuse one of these -- see create_custom_food().
+# A serving name that leads with a plain number, e.g. "2 cookies".
+_QUANTITY_LED_NAME = re.compile(r"^\s*(\d+(?:\.\d+)?)\s+(\S.*)$")
+
 _RESERVED_CUSTOM_FOOD_NUTRIENT_IDS = frozenset(
     {
         NUTRIENT_IDS["energy"],
@@ -825,6 +830,7 @@ class CronometerClient:
         extra_nutrients: dict[int, float] | None = None,
         serving_name: str | None = None,
         serving_grams: float | None = None,
+        serving_quantity: float | None = None,
     ) -> dict:
         """Edit a user-created custom food in place.
 
@@ -834,6 +840,16 @@ class CronometerClient:
         normalized to per-100g like create_custom_food. Changing serving_grams
         alone leaves the stored per-100g values as they are, so the food's
         per-serving numbers shift with the new weight.
+
+        A measure is `amount` units of `name` weighing `value` grams in total,
+        and the app renders the serving as "<amount> <name>". Setting the
+        weight therefore also resets the quantity (to serving_quantity, or 1)
+        and makes the measure a named ("Atomic") serving. Otherwise a food
+        first saved as "400 g" keeps amount=400 and type "Weight" and shows up
+        as "400 <serving_name>" with no weight of its own. A quantity leading
+        serving_name ("2 cookies") is moved into the quantity for the same
+        reason. A quantity set without serving_grams keeps the total weight,
+        so the per-unit weight changes.
 
         Returns {"food_id": int, "name": str}.
         """
@@ -845,6 +861,26 @@ class CronometerClient:
                     f"macro args: {sorted(overlap)}. Use the named args for "
                     f"those instead."
                 )
+
+        # The server splits a leading quantity off a new measure's name
+        # ("10 pieces" is stored as amount=10, name="pieces") but not when
+        # an existing measure is re-sent, so do the same here. Done before
+        # validation so an inferred quantity is checked too.
+        quantity_label = "serving_quantity"
+        if serving_name is not None:
+            led = _QUANTITY_LED_NAME.match(serving_name)
+            if led and float(led.group(1)) > 0:
+                serving_name = led.group(2)
+                if serving_quantity is None:
+                    serving_quantity = float(led.group(1))
+                    quantity_label = "serving_name quantity"
+
+        for label, v in (
+            ("serving_grams", serving_grams),
+            (quantity_label, serving_quantity),
+        ):
+            if v is not None and not (math.isfinite(v) and v > 0):
+                raise ValueError(f"{label} must be a positive number, got {v!r}")
 
         with self._food_lock(food_id):
             food = self._get_custom_food(food_id)
@@ -862,6 +898,11 @@ class CronometerClient:
                     measure["name"] = serving_name
                 if serving_grams is not None:
                     measure["value"] = serving_grams
+                if serving_grams is not None or serving_quantity is not None:
+                    measure["amount"] = (
+                        serving_quantity if serving_quantity is not None else 1.0
+                    )
+                    measure["type"] = "Atomic"
             grams = (measure or {}).get("value") or 100.0
             scale = 100.0 / grams if grams > 0 else 1.0
 
@@ -1642,9 +1683,11 @@ class CronometerClient:
         merges per-entry:
 
           - name, source, category: from the food object
-          - measure: {measure_id, name, grams_per_unit} for the entry's
-            measureId (falls back to the food's defaultMeasureId)
-          - servings: grams / grams_per_unit, when derivable
+          - serving_size: {measure_id, quantity, unit, grams} defining one
+            portion in the entry's measureId (falls back to defaultMeasureId).
+            Recipe measures have null grams: their value is a reference-serving
+            count, not a gram weight.
+          - servings: number of those portions consumed, when derivable
           - nutrients: the food's nutrient profile scaled to the entry's amount
             (per-100g for Weight/Atomic measures, per-serving for Recipe
             measures), labeled with name/unit/category via the nutrient
@@ -1705,18 +1748,26 @@ class CronometerClient:
             )
             grams = entry.get("grams")
             if measure:
-                grams_per_unit = measure.get("value")
-                entry["measure"] = {
+                portion_value = measure.get("value")
+                quantity = measure.get("amount", 1)
+                if not (
+                    isinstance(quantity, (int, float))
+                    and math.isfinite(quantity)
+                    and quantity > 0
+                ):
+                    quantity = None
+                entry["serving_size"] = {
                     "measure_id": measure.get("id"),
-                    "name": measure.get("name"),
-                    "grams_per_unit": grams_per_unit,
+                    "quantity": quantity,
+                    "unit": measure.get("name"),
+                    "grams": None if measure.get("type") == "Recipe" else portion_value,
                 }
                 if (
                     isinstance(grams, (int, float))
-                    and isinstance(grams_per_unit, (int, float))
-                    and grams_per_unit
+                    and isinstance(portion_value, (int, float))
+                    and portion_value
                 ):
-                    entry["servings"] = round(grams / grams_per_unit, 4)
+                    entry["servings"] = round(grams / portion_value, 4)
 
             # Nutrient scaling depends on the measure type:
             #   - Recipe measures: nutrients are stored per one reference

@@ -162,9 +162,182 @@ def test_update_custom_food_serving_overrides_measure_and_scale(tmp_path):
     data = state["payloads"][1]["data"]
     (measure,) = data["measures"]
     assert measure["id"] == 900
-    assert measure["name"] == "1 cup"
+    assert measure["name"] == "cup"  # the leading 1 is the quantity
+    assert measure["amount"] == 1.0
     assert measure["value"] == 200
     assert nutrients_by_id(state["payloads"][1])[208] == 200.0  # 400 per 200 g
+
+
+def weight_default_food() -> dict:
+    """A food first saved as "400 g": its default measure is 400 units of a
+    Weight measure, which the app renders as "400 <name>"."""
+    food = custom_food()
+    food["measures"][0].update(name="1 serving", amount=400, value=250, type="Weight")
+    return food
+
+
+def test_update_custom_food_serving_grams_resets_quantity_and_type(tmp_path):
+    """Setting the weight makes the default measure one named serving, so a
+    food first saved as "400 g" stops rendering as "400 <name>"."""
+    client, state = make_cold_client(tmp_path, [weight_default_food(), OK])
+
+    client.update_custom_food(FOOD_ID, serving_name="serving", serving_grams=250)
+
+    (measure,) = state["payloads"][1]["data"]["measures"]
+    assert measure["id"] == 900
+    assert measure["name"] == "serving"
+    assert measure["value"] == 250
+    assert measure["amount"] == 1.0
+    assert measure["type"] == "Atomic"
+
+
+def test_update_custom_food_serving_quantity(tmp_path):
+    """serving_quantity sets how many units the default serving is, alone or
+    together with the weight."""
+    client, state = make_cold_client(
+        tmp_path, [weight_default_food(), OK, custom_food(), OK]
+    )
+
+    client.update_custom_food(FOOD_ID, serving_quantity=1)
+    (measure,) = state["payloads"][1]["data"]["measures"]
+    assert (measure["amount"], measure["value"], measure["type"]) == (1, 250, "Atomic")
+
+    client.update_custom_food(FOOD_ID, serving_grams=30, serving_quantity=2)
+    (measure,) = state["payloads"][3]["data"]["measures"]
+    assert (measure["amount"], measure["value"]) == (2, 30)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"serving_name": "2 cookies"},
+        {"serving_name": "cookies", "serving_quantity": 2},
+    ],
+)
+@pytest.mark.parametrize(
+    ("measure_id", "quantity", "unit", "grams", "counts"),
+    [
+        (900, 2, "cookies", 30, (0.5, 1, 1.5)),
+        (901, 1, "cookie", 15, (1, 2, 3)),
+    ],
+)
+def test_update_custom_food_serving_size_in_diary(
+    tmp_path, monkeypatch, kwargs, measure_id, quantity, unit, grams, counts
+):
+    food = custom_food()
+    food["measures"].append(
+        {"id": 901, "name": "cookie", "amount": 1, "value": 15, "type": "Atomic"}
+    )
+    client, state = make_cold_client(tmp_path, [food, OK])
+    client.update_custom_food(FOOD_ID, serving_grams=30, **kwargs)
+
+    saved = state["payloads"][1]["data"]
+    monkeypatch.setattr(client, "get_foods", lambda ids: [saved])
+    monkeypatch.setattr(client, "get_nutrient_definitions", dict)
+    diary = client.enrich_diary_servings(
+        {
+            "diary": [
+                {
+                    "type": "Serving",
+                    "foodId": FOOD_ID,
+                    "measureId": measure_id,
+                    "grams": consumed_grams,
+                }
+                for consumed_grams in (15, 30, 45)
+            ]
+        }
+    )
+
+    for entry, count, calories in zip(diary["diary"], counts, (30, 60, 90)):
+        assert entry["serving_size"] == {
+            "measure_id": measure_id,
+            "quantity": quantity,
+            "unit": unit,
+            "grams": grams,
+        }
+        assert entry["servings"] == count
+        assert "measure" not in entry
+        assert "quantity" not in entry
+        energy = next(n for n in entry["nutrients"] if n["id"] == 208)
+        assert energy["amount"] == calories
+
+
+@pytest.mark.parametrize(
+    ("given", "kwargs", "name", "amount"),
+    [
+        ("1 serving", {}, "serving", 1.0),
+        ("10 pieces", {}, "pieces", 10.0),
+        ("1.5 cups", {}, "cups", 1.5),
+        ("2 cookies", {"serving_quantity": 3}, "cookies", 3),
+        ("1/2 cup", {"serving_grams": 120}, "1/2 cup", 1.0),
+        ("0 calorie syrup", {"serving_grams": 15}, "0 calorie syrup", 1.0),
+    ],
+)
+def test_update_custom_food_quantity_led_serving_name(
+    tmp_path, given, kwargs, name, amount
+):
+    """A plain number leading serving_name becomes the quantity, as the server
+    does for a new measure; an explicit serving_quantity wins."""
+    client, state = make_cold_client(tmp_path, [weight_default_food(), OK])
+
+    client.update_custom_food(FOOD_ID, serving_name=given, **kwargs)
+
+    (measure,) = state["payloads"][1]["data"]["measures"]
+    assert (measure["name"], measure["amount"], measure["type"]) == (
+        name,
+        amount,
+        "Atomic",
+    )
+
+
+def test_update_custom_food_serving_name_alone_keeps_quantity(tmp_path):
+    client, state = make_cold_client(tmp_path, [weight_default_food(), OK])
+
+    client.update_custom_food(FOOD_ID, serving_name="portion")
+
+    (measure,) = state["payloads"][1]["data"]["measures"]
+    assert (measure["name"], measure["amount"], measure["type"]) == (
+        "portion",
+        400,
+        "Weight",
+    )
+
+
+@pytest.mark.parametrize("field", ["serving_grams", "serving_quantity"])
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf")])
+def test_update_custom_food_rejects_bad_serving_numbers(tmp_path, field, bad):
+    client, state = make_cold_client(tmp_path, [])
+
+    with pytest.raises(ValueError, match=field):
+        client.update_custom_food(FOOD_ID, **{field: bad})
+    assert state["payloads"] == []
+
+
+def test_update_custom_food_rejects_overflowing_name_quantity(tmp_path):
+    """A leading number too large for a float would become inf; it is
+    rejected before anything is fetched or saved."""
+    client, state = make_cold_client(tmp_path, [])
+
+    with pytest.raises(ValueError, match="serving_name quantity"):
+        client.update_custom_food(FOOD_ID, serving_name="9" * 400 + " cookies")
+    assert state["payloads"] == []
+
+
+def test_update_custom_food_quantity_alone_keeps_total_weight(tmp_path):
+    """Without serving_grams, a new quantity keeps the serving's total weight:
+    "2 cookies = 30 g" becomes "3 cookies = 30 g"."""
+    food = custom_food()
+    food["measures"][0].update(name="cookies", amount=2, value=30)
+    client, state = make_cold_client(tmp_path, [food, OK])
+
+    client.update_custom_food(FOOD_ID, serving_quantity=3)
+
+    (measure,) = state["payloads"][1]["data"]["measures"]
+    assert (measure["name"], measure["amount"], measure["value"]) == (
+        "cookies",
+        3,
+        30,
+    )
 
 
 def test_update_custom_food_extra_nutrients(tmp_path):
