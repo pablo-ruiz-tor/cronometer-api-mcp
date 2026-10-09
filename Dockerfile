@@ -72,7 +72,7 @@ ENTRYPOINT ["/bin/sh", "-c", "exec supergateway \
   --stdio 'cronometer-api-mcp' \
   --outputTransport streamableHttp \
   --stateful \
-  --streamableHttpPath /mcp \
+  --streamableHttpPath \"${MCP_SECRET_PATH}\" \
   --healthEndpoint /healthz \
   --port \"${PORT}\" \
   --sessionTimeout 3600000 \
